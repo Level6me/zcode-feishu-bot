@@ -42,7 +42,6 @@ class CardBuilder:
     build_note_list_card = staticmethod(memory.build_note_list_card)
     build_global_memory_card = staticmethod(memory.build_global_memory_card)
 
-    build_quota_card = staticmethod(stats_cards.build_quota_card)
     build_context_card = staticmethod(stats_cards.build_context_card)
 
     build_auth_hint_card = staticmethod(auth.build_auth_hint_card)

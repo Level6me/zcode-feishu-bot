@@ -7,7 +7,7 @@ ZCODE_CREDENTIAL_SECRET env var). We decrypt via a tiny node one-liner —
 node is guaranteed present because the zcode engine itself runs on it.
 
 Public API:
-    fetch_quota() / is_quota_error() / detect_and_format_quota_error()
+    is_quota_error() / detect_and_format_quota_error()
     check_latest_zcode_log_for_quota_error()
 """
 
@@ -92,12 +92,7 @@ def _load_account_info() -> dict:
     return info
 
 
-def get_zcode_account() -> str:
-    """获取 zcode 引擎当前登录的账号 Email"""
-    return _load_account_info().get("email", "")
 
-
-# Back-compat alias
 def get_zcode_engine_version() -> str:
     try:
         from config import find_zcode_bin
@@ -108,30 +103,6 @@ def get_zcode_engine_version() -> str:
         return out.splitlines()[0] if out else ""
     except Exception:
         return ""
-
-
-def fetch_quota():
-    """Engine account/plan snapshot for the /quota card.
-
-    zcode does not expose a local plan-quota endpoint, so we surface the
-    account, engine version and a console deep link instead of raw buckets.
-    """
-    info = _load_account_info()
-    try:
-        from config import ZCODE_PROVIDER_ID, ZCODE_MODEL_ID
-    except Exception:
-        ZCODE_PROVIDER_ID = ZCODE_MODEL_ID = ""
-    return {
-        "engine": "zcode",
-        "logged_in": bool(info.get("provider")),
-        "email": info.get("email", ""),
-        "provider": info.get("provider", ""),
-        "user_id": info.get("user_id", ""),
-        "plan_provider": ZCODE_PROVIDER_ID,
-        "default_model": ZCODE_MODEL_ID,
-        "engine_version": get_zcode_engine_version(),
-        "console_url": "https://z.ai/manage-apikey/subscription",
-    }
 
 
 _QUOTA_ERROR_PATTERNS = (

@@ -145,25 +145,28 @@ def get_oauth_token_path() -> str:
 
 
 def get_global_memory_path() -> str:
-    """Global cross-session memory (zcode persistent memory index)."""
+    """Global cross-session memory (zcode persistent memory index).
+
+    zcode stores per-project memories under
+      ~/.zcode/cli/memories/projects/<project>/memory/MEMORY.md
+    Returns the path only if it exists; otherwise empty string signals
+    "memory not configured" (the /brain card renders an empty state).
+    """
     home = get_zcode_home()
-    cli_memories = os.path.join(home, "cli", "memories")
-    if os.path.isdir(cli_memories):
-        # project-scoped memory roots: prefer the default project workspace
-        projects = os.path.join(cli_memories, "projects")
-        if os.path.isdir(projects):
-            candidate = os.path.join(projects, "default", "MEMORY.md")
-            if os.path.exists(candidate):
-                return candidate
-            # fallback: first project with a MEMORY.md
-            try:
-                for entry in sorted(os.listdir(projects)):
-                    candidate = os.path.join(projects, entry, "MEMORY.md")
-                    if os.path.exists(candidate):
-                        return candidate
-            except Exception:
-                pass
-    return os.path.join(home, "global_memory.json")
+    projects_dir = os.path.join(home, "cli", "memories", "projects")
+    candidates = []
+    if os.path.isdir(projects_dir):
+        try:
+            for entry in os.listdir(projects_dir):
+                candidate = os.path.join(projects_dir, entry, "memory", "MEMORY.md")
+                if os.path.exists(candidate):
+                    candidates.append((os.path.getmtime(candidate), candidate))
+        except Exception:
+            pass
+    if candidates:
+        candidates.sort(reverse=True)  # most recently updated project first
+        return candidates[0][1]
+    return ""
 
 
 def _find_node() -> Optional[str]:

@@ -10,15 +10,6 @@ from cards.common import create_footer
 # 北京时间 (UTC+8) 时区定义
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_zcode_account() -> str:
-    """获取 zcode 引擎当前登录的账号 Email"""
-    try:
-        from utils.quota import get_zcode_account as _get
-        return _get()
-    except Exception:
-        return ""
-
-
 def get_local_tz_info():
     """获取当前系统设备的本地时区对象与 UTC 偏移量字符串 (如 UTC+8, UTC-5)"""
     try:
@@ -41,65 +32,6 @@ def get_local_tz_info():
         return timezone.utc, "UTC+0"
 
 LOCAL_TZ, LOCAL_TZ_STR = get_local_tz_info()
-
-
-def build_quota_card(quota_data):
-    account_email = get_zcode_account()
-    quota_data = quota_data or {}
-    logged_in = quota_data.get("logged_in", bool(account_email))
-    engine_version = quota_data.get("engine_version", "")
-    plan_provider = quota_data.get("plan_provider", "")
-    default_model = quota_data.get("default_model", "")
-
-    header_content = "⚡ **ZCode 引擎账户看板** (z.ai Coding Plan)"
-    if account_email:
-        header_content += f"\n👤 **当前登录账号**: `{account_email}`"
-    if engine_version:
-        header_content += f"\n🛠️ **引擎版本**: `{engine_version}`"
-
-    elements = [
-        {"tag": "markdown", "content": header_content},
-        {"tag": "hr"},
-    ]
-
-    if not logged_in:
-        elements.append({
-            "tag": "markdown",
-            "content": "❌ **引擎未登录**\n请在宿主机运行 `zcode login zai` 完成 Z.ai 账号授权后再使用。"
-        })
-    else:
-        rows = []
-        if plan_provider:
-            rows.append(f"• **订阅通道**: `{plan_provider}`")
-        if default_model:
-            rows.append(f"• **默认模型**: `{default_model}`")
-        rows.append("• **用量明细**: 前往 [Z.ai 控制台](https://z.ai/manage-apikey/subscription) 查看套餐余量")
-        elements.append({"tag": "markdown", "content": "\n".join(rows)})
-
-    elements += [
-        {"tag": "hr"},
-        {
-            "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🔄 刷新账户状态"},
-                    "type": "primary",
-                    "value": {"action": "refresh_quota"}
-                }
-            ]
-        },
-        create_footer(),
-    ]
-
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "blue",
-            "title": {"content": "📊 Z.ai 套餐账户查询", "tag": "plain_text"}
-        },
-        "elements": elements
-    }
 
 
 def build_context_card(stats):

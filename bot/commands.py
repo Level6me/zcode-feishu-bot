@@ -250,12 +250,6 @@ async def handle_slash_command(user_text, message_id, chat_id, session_data, run
                 lambda: send_reply_sdk(message_id, "🔒 该命令仅管理员可用。"),
             )
             return True, user_text
-        if user_text.strip() == "/quota" and not has_scope(chat_id, "quota"):
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: send_reply_sdk(message_id, "🔒 当前会话未获得查看额度的权限。"),
-            )
-            return True, user_text
     
     # Dynamic slash command detection via plugin manager
     first_word = user_text.split()[0] if user_text.strip() else ""
@@ -797,17 +791,6 @@ async def handle_slash_command(user_text, message_id, chat_id, session_data, run
         overview = await asyncio.get_running_loop().run_in_executor(None, fetch_plan_overview)
         plan_card = build_plan_card(overview or {}, current_model=session_data.get("model", ""))
         await asyncio.get_running_loop().run_in_executor(None, lambda: send_interactive_card_sdk(message_id, plan_card))
-        return True, user_text
-
-    elif user_text.strip() == "/quota":
-        from utils.quota import fetch_quota
-        try:
-            quota_data = await asyncio.get_running_loop().run_in_executor(None, fetch_quota)
-        except Exception as e:
-            log.error(f"[/quota] fetch_quota failed: {e}")
-            quota_data = None
-        quota_card = CardBuilder.build_quota_card(quota_data)
-        await asyncio.get_running_loop().run_in_executor(None, lambda: send_interactive_card_sdk(message_id, quota_card))
         return True, user_text
 
     elif user_text.strip() == "/brain":
