@@ -1,0 +1,12 @@
+{
+  "id": "rpi_gpio_status",
+  "name": "🍓 树莓派 GPIO 状态灯指示 (物理直驱版)",
+  "version": "1.0.0",
+  "author": "ZCode",
+  "description": "通过树莓派底层 GPIO 硬件直接驱动控制红绿黄三色 LED 灯",
+  "commands": [
+    "/gpio_led",
+    "/rpi_gpio"
+  ],
+  "enabled": false
+}

@@ -1,0 +1,13 @@
+{
+  "id": "rpi_gpio_api_status",
+  "name": "🍓 树莓派 GPIO 状态灯与蜂鸣器指示 (API 网关版)",
+  "version": "2.2.0",
+  "author": "ZCode",
+  "description": "基于 pi_led_api 与 buzzer-api 控制红绿黄三色 LED 与 PWM 硬件蜂鸣器提示音，实时联动 AI 思考、工具调用与任务完成状态，并提供重构控制台与 /stat 状态指令",
+  "commands": [
+    "/led",
+    "/light",
+    "/stat"
+  ],
+  "enabled": true
+}

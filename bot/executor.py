@@ -1,0 +1,1721 @@
+import asyncio
+import os
+import time
+import json
+import uuid
+import re
+import subprocess
+from config import get_brain_dir, get_transcript_path, BASE_DIR, zcode_engine_argv
+import config
+from logger import log
+from card_builder import CardBuilder
+from lark_client import patch_interactive_card_sdk, send_interactive_card_sdk, api_client
+from multimodal import extract_and_upload_resources
+from database import save_session_async
+import stats
+import app_state
+from utils.auth import SCOPE_PROJECT, allow_execution, has_scope, is_admin
+
+# 增量读取状态：transcript 路径 -> [offset, size]
+_transcript_read_state = {}
+
+# 追踪进程 CPU 时间差值: pid -> (last_check_timestamp, cumulative_cputime_seconds)
+_process_cpu_tracker = {}
+
+def _parse_cputime(s: str) -> float:
+    """Parse cputime string like '0:00.02', '1:57.84', '01:23:45.67', '1-02:03:04' into seconds."""
+    try:
+        s = s.strip()
+        if not s:
+            return 0.0
+        days = 0.0
+        if '-' in s:
+            d_part, s = s.split('-', 1)
+            days = float(d_part)
+        parts = s.split(':')
+        if len(parts) == 3:
+            h, m, sec = parts
+            return days * 86400.0 + float(h) * 3600.0 + float(m) * 60.0 + float(sec)
+        elif len(parts) == 2:
+            m, sec = parts
+            return days * 86400.0 + float(m) * 60.0 + float(sec)
+        elif len(parts) == 1:
+            return days * 86400.0 + float(parts[0])
+    except Exception:
+        return 0.0
+    return 0.0
+
+# 常见本地/云端编译、构建、打包、网络 I/O 及工具进程名集合
+ACTIVE_WORKER_NAMES = {
+    # 编译与构建工具
+    "gcc", "g++", "clang", "clang++", "rustc", "cargo", "go", "javac", "java", "mvn", "gradle",
+    "make", "gmake", "cmake", "ninja", "msbuild", "dotnet", "scalac", "sbt", "kotlinc",
+    # 脚本与包管理器 / 打包工具
+    "node", "npm", "npx", "yarn", "pnpm", "bun", "webpack", "vite", "esbuild", "rollup", "next",
+    "python", "python3", "pytest", "pip", "poetry", "uv", "pipenv", "conda",
+    # 容器、虚拟化与远程/云端构建调用
+    "docker", "podman", "containerd", "buildkitd", "nerdctl", "kubectl", "helm",
+    "ssh", "scp", "rsync", "git", "gh", "curl", "wget", "tar", "zip", "unzip", "gzip", "zstd"
+}
+
+def _clean_process_command(cmd: str) -> str:
+    """清理并美化进程执行命令，去除包装层，提取核心可读指令。"""
+    if not cmd:
+        return ""
+    cmd = re.sub(r'[\r\n\t]+', ' ', cmd).strip()
+    cmd = re.sub(r'^timeout\s+\d+\s+', '', cmd).strip()
+    cmd = re.sub(r'^/bin/bash\s+-c\s+', '', cmd).strip()
+    cmd = re.sub(r'^/bin/sh\s+-c\s+', '', cmd).strip()
+    cmd = re.sub(r'^bash\s+-c\s+', '', cmd).strip()
+    cmd = re.sub(r'^sh\s+-c\s+', '', cmd).strip()
+    cmd = cmd.strip(' "\'`')
+    if len(cmd) > 80:
+        return cmd[:77] + "..."
+    return cmd
+
+def _get_process_tree_status(root_pid: int) -> dict:
+    """获取以 root_pid 为根的完整进程树状态（不仅限于同 PGID，覆盖所有 fork/exec 逃逸出的子孙进程）。
+    结合 Linux /proc 与 ps，提取实际运行指令、系统调用与内核等待状态、IO及CPU消耗。
+    返回:
+        total_cputime: 递归所有子孙进程的 CPU 时间之和
+        has_active_workers: 进程树中是否存在编译器/构建器/云端网络客户端等工作子进程
+        worker_names: 发现的活跃工作进程名称列表
+        detail_cmd: 当前实际运行的最深层/最活跃的核心命令
+        all_pids: 属于该树的所有 PID 集合
+        running_count: 处于 R(运行) 状态的进程数
+        sleeping_count: 处于 S(可中断睡眠/等待IO/网络) 状态的进程数
+        deadlock_suspect: 是否疑似 D(不可中断死锁/磁盘挂起) 或 Z(僵尸) 状态
+    """
+    if not root_pid:
+        return {
+            "total_cputime": 0.0, "has_active_workers": False, "worker_names": [],
+            "detail_cmd": "", "all_pids": set(), "running_count": 0,
+            "sleeping_count": 0, "deadlock_suspect": False
+        }
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid,ppid,state,wchan:20,comm,cputime,args"],
+            text=True, timeout=3
+        ).strip()
+        
+        children_map = {}
+        proc_info_map = {}
+        
+        for line in out.splitlines()[1:]:
+            parts = line.split(None, 6)
+            if len(parts) >= 6:
+                try:
+                    p = int(parts[0])
+                    pp = int(parts[1])
+                    state = parts[2]
+                    wchan = parts[3]
+                    c = parts[4]
+                    t = _parse_cputime(parts[5])
+                    raw_args = parts[6] if len(parts) > 6 else c
+                    children_map.setdefault(pp, []).append(p)
+                    proc_info_map[p] = {
+                        "pid": p, "ppid": pp, "state": state, "wchan": wchan,
+                        "comm": c, "cputime": t, "args": raw_args
+                    }
+                except (ValueError, TypeError):
+                    continue
+
+        # BFS 遍历 root_pid 的整个子孙树
+        all_pids = set()
+        queue = [root_pid]
+        while queue:
+            curr = queue.pop(0)
+            all_pids.add(curr)
+            if curr in children_map:
+                for child in children_map[curr]:
+                    if child not in all_pids:
+                        queue.append(child)
+
+        total_cpu = 0.0
+        active_workers = []
+        detail_cmd = ""
+        running_count = 0
+        sleeping_count = 0
+        d_state_count = 0
+        
+        # 寻找最深层的活动子进程命令（排除顶层壳或包装器）
+        candidate_cmds = []
+        for p in all_pids:
+            info = proc_info_map.get(p)
+            if not info:
+                continue
+            total_cpu += info["cputime"]
+            comm = info["comm"].lower()
+            state = info["state"]
+            
+            if "R" in state:
+                running_count += 1
+            elif "S" in state:
+                sleeping_count += 1
+            elif "D" in state:
+                d_state_count += 1
+                
+            if comm in ACTIVE_WORKER_NAMES:
+                active_workers.append(comm)
+                cleaned = _clean_process_command(info["args"])
+                if cleaned and cleaned not in ("bash", "sh", "timeout"):
+                    candidate_cmds.append((p, comm, cleaned))
+
+        if candidate_cmds:
+            # 优先采用最深层/最新的实际构建命令
+            detail_cmd = candidate_cmds[-1][2]
+        elif len(all_pids) > 1:
+            # 如果没有预定义白名单但有子进程，提取末尾子进程命令
+            for p in sorted(list(all_pids), reverse=True):
+                if p != root_pid:
+                    info = proc_info_map.get(p)
+                    if info:
+                        cleaned = _clean_process_command(info["args"])
+                        if cleaned and cleaned not in ("bash", "sh", "timeout"):
+                            detail_cmd = cleaned
+                            break
+
+        return {
+            "total_cputime": total_cpu,
+            "has_active_workers": len(active_workers) > 0 or len(all_pids) > 1,
+            "worker_names": active_workers,
+            "detail_cmd": detail_cmd,
+            "all_pids": all_pids,
+            "running_count": running_count,
+            "sleeping_count": sleeping_count,
+            "deadlock_suspect": d_state_count > 0 and running_count == 0
+        }
+    except Exception as e:
+        log.warning(f"[Executor] Process tree check failed for PID {root_pid}: {e}")
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(root_pid), "-o", "cputime="],
+                text=True, timeout=2
+            ).strip()
+            return {
+                "total_cputime": _parse_cputime(out),
+                "has_active_workers": False,
+                "worker_names": [],
+                "detail_cmd": "",
+                "all_pids": {root_pid},
+                "running_count": 0,
+                "sleeping_count": 1,
+                "deadlock_suspect": False
+            }
+        except Exception:
+            return {
+                "total_cputime": 0.0, "has_active_workers": False, "worker_names": [],
+                "detail_cmd": "", "all_pids": set(), "running_count": 0,
+                "sleeping_count": 0, "deadlock_suspect": False
+            }
+
+def _is_process_group_active(pid: int, min_cpu_percent: float = 0.02, vitality_state=None) -> dict:
+    """深度检测整个进程树是否有真实进展活动（HMDM Layer 4B I/O + CPU EWMA 活性模型）：
+    涵盖本地高 CPU 运算、/proc/<pid>/io 真实读写字节增量、本轮新派生的活跃子进程，
+    彻底剔除“温池常驻休眠子进程 (S态) 永远重置看门狗导致卡死 12 小时”的假活漏洞。
+    """
+    if not pid:
+        return {"active": False, "reason": "no_pid", "workers": [], "status_desc": "无活动进程", "detail_cmd": ""}
+    
+    status = _get_process_tree_status(pid)
+    current_cputime = status["total_cputime"]
+    now = time.time()
+    
+    cpu_active = False
+    cpu_usage_pct = 0.0
+    if pid in _process_cpu_tracker:
+        last_time, last_cputime = _process_cpu_tracker[pid]
+        time_delta = now - last_time
+        cpu_delta = current_cputime - last_cputime
+        _process_cpu_tracker[pid] = (now, current_cputime)
+        if time_delta > 0:
+            cpu_usage_pct = (cpu_delta / time_delta) * 100.0
+            cpu_active = (cpu_delta / time_delta) > min_cpu_percent
+    else:
+        if len(_process_cpu_tracker) > 500:
+            oldest_pid = min(_process_cpu_tracker, key=lambda k: _process_cpu_tracker[k][0])
+            _process_cpu_tracker.pop(oldest_pid, None)
+        _process_cpu_tracker[pid] = (now, current_cputime)
+    if len(_transcript_read_state) > 500:
+        for _old_k in list(_transcript_read_state.keys())[:100]:
+            _transcript_read_state.pop(_old_k, None)
+
+    workers = status["worker_names"]
+    detail_cmd = status["detail_cmd"]
+
+    # 使用 HMDM Layer 4B 采集进程树真实 I/O 增量与非基线新子进程
+    vitality_info = {}
+    if vitality_state is not None:
+        try:
+            from math_decision_model import measure_process_tree_vitality
+            vitality_info = measure_process_tree_vitality(pid, vitality_state)
+        except Exception:
+            vitality_info = {}
+
+    io_delta = vitality_info.get("io_delta", 0)
+    new_active_pids = vitality_info.get("new_active_pids", [])
+
+    # 1. 本地高强度 CPU 编译/运算中
+    if cpu_active:
+        desc = f"本地运算中 (CPU: {cpu_usage_pct:.1f}%)"
+        if workers:
+            desc = f"构建编译中 (CPU: {cpu_usage_pct:.1f}%, 进程: {', '.join(workers[:2])})"
+        return {
+            "active": True,
+            "reason": "cpu_busy",
+            "workers": workers,
+            "status_desc": desc,
+            "detail_cmd": detail_cmd
+        }
+    
+    # 2. 存在真实磁盘/管道 I/O 读写增量，或本轮新派生的活跃工作子进程（非温池启动前残留的休眠守护进程）
+    if io_delta > 128 or (workers and (new_active_pids or status["running_count"] > 0)):
+        worker_str = ", ".join(workers[:2]) if workers else f"IO+{io_delta}B"
+        return {
+            "active": True,
+            "reason": "active_io_or_worker",
+            "workers": workers,
+            "status_desc": f"任务执行中 ({worker_str} 正在推进)",
+            "detail_cmd": detail_cmd
+        }
+
+    # 3. 存在处于运行态(R)或本轮新拉起且未超时的子命令进程
+    if status["running_count"] > 0 or len(new_active_pids) > 0:
+        desc = "后台子任务运行中" if status["running_count"] > 0 else "等待子命令网络/外部 I/O 响应"
+        return {
+            "active": True,
+            "reason": "new_subprocesses_active",
+            "workers": workers,
+            "status_desc": desc,
+            "detail_cmd": detail_cmd
+        }
+
+    # 4. 疑似内核不可中断死锁 (D 状态且无 I/O 增量)
+    if status["deadlock_suspect"]:
+        return {
+            "active": False,
+            "reason": "deadlock_suspect",
+            "workers": workers,
+            "status_desc": "⚠️ 检测到不可中断磁盘/内核态挂起",
+            "detail_cmd": detail_cmd
+        }
+
+    return {
+        "active": False,
+        "reason": "idle",
+        "workers": [],
+        "status_desc": "进程处于静默等待",
+        "detail_cmd": ""
+    }
+
+def format_tool_action(tool_name: str = "", params: dict = None, raw_action: str = "") -> str:
+    """Format and streamline tool actions to avoid verbose code snippets or multi-line commands."""
+    params = params or {}
+    tool_name = (tool_name or "").strip()
+
+    # 1. 优先提取语义化的工具动作说明
+    act = params.get("toolAction") or params.get("toolSummary") or raw_action or ""
+    if isinstance(act, str):
+        act = act.replace('"', '').replace("'", "").strip()
+        act = re.sub(r'[\r\n\t]+', ' ', act).strip()
+        act = re.sub(r'\s+', ' ', act)
+        act = CardBuilder.translate_action_verb(act)
+    else:
+        act = ""
+
+    # 如果有明确简短的描述且不是底层代码/命令
+    if act and not any(act.startswith(p) for p in ["python", "timeout", "sh", "bash", "cat", "echo", "export"]):
+        action_verbs = ["连接", "下载", "检查", "分析", "生成", "写入", "查看", "搜索", "读取", "编辑", "查询", "汇总", "获取", "上传", "发送", "整理", "运行", "执行"]
+        if len(act) <= 25:
+            if act.startswith("正在"):
+                return act
+            if any(act.startswith(v) for v in action_verbs):
+                return f"正在{act}"
+            return f"正在执行 {act}"
+        brief = act[:22] + "..."
+        if brief.startswith("正在"):
+            return brief
+        if any(brief.startswith(v) for v in action_verbs):
+            return f"正在{brief}"
+        return f"正在执行 {brief}"
+
+    # 2. 针对 run_command 提取精炼用途，严禁直接展示多行代码
+    cmd = (params.get("CommandLine") or params.get("command") or "").strip()
+    if tool_name == "run_command" or cmd:
+        clean_cmd = re.sub(r'^timeout\s+\d+\s+', '', cmd).strip()
+        clean_cmd = re.sub(r'[\r\n\t]+', ' ', clean_cmd).strip(' "\'`')
+        clean_cmd = re.sub(r'\s+', ' ', clean_cmd)
+
+        if not clean_cmd:
+            return "正在执行终端命令"
+        first = clean_cmd.split()[0] if clean_cmd else ""
+        if first in ("python", "python3"):
+            if "sqlite3" in clean_cmd or "db" in clean_cmd:
+                return "正在查询本地数据库"
+            return "正在执行 Python 脚本"
+        elif first in ("docker", "docker-compose"):
+            return "正在查询 Docker 容器"
+        elif first == "git":
+            return "正在执行 Git 操作"
+        elif first in ("grep", "rg"):
+            return "正在检索文件内容"
+        elif first in ("find", "fd", "ls"):
+            return "正在查找系统文件"
+        elif first in ("curl", "wget"):
+            return "正在请求网络数据"
+        else:
+            brief = clean_cmd[:18] + "..." if len(clean_cmd) > 20 else clean_cmd
+            return f"正在运行命令: {brief}"
+
+    # 3. 针对常用文件与交互工具
+    if tool_name == "view_file":
+        path = params.get("AbsolutePath") or params.get("path") or ""
+        fname = os.path.basename(path.strip(' "\'')) if path else ""
+        return f"正在读取文件: {fname}" if fname else "正在读取文件"
+    elif tool_name in ("write_to_file", "replace_file_content"):
+        path = params.get("TargetFile") or params.get("path") or ""
+        fname = os.path.basename(path.strip(' "\'')) if path else ""
+        return f"正在编辑文件: {fname}" if fname else "正在修改文件"
+    elif tool_name == "grep_search":
+        q = (params.get("Query") or "").strip(' "\'')
+        q = re.sub(r'[\r\n\t]+', ' ', q)[:12]
+        return f"正在搜索代码: {q}" if q else "正在搜索代码"
+    elif tool_name == "find_by_name":
+        p = (params.get("Pattern") or "").strip(' "\'')
+        p = re.sub(r'[\r\n\t]+', ' ', p)[:12]
+        return f"正在查找文件: {p}" if p else "正在查找文件"
+    elif tool_name == "list_dir":
+        return "正在浏览目录结构"
+    elif tool_name == "search_web":
+        return "正在联网搜索资料"
+    elif tool_name == "read_url_content":
+        return "正在抓取网页内容"
+    elif tool_name == "invoke_subagent":
+        return "正在调度子智能体"
+    elif tool_name == "manage_task":
+        return "正在管理后台任务"
+
+    # 工具名中文映射兜底
+    TOOL_MAP = {
+        "run_command": "执行终端命令",
+        "view_file": "读取文件",
+        "write_to_file": "写入文件",
+        "replace_file_content": "编辑文件",
+        "grep_search": "搜索代码",
+        "find_by_name": "查找文件",
+        "list_dir": "浏览目录",
+        "search_web": "联网搜索",
+        "read_url_content": "抓取网页",
+        "manage_task": "管理任务",
+        "invoke_subagent": "调度智能体",
+    }
+    if tool_name in TOOL_MAP:
+        return f"正在{TOOL_MAP[tool_name]}"
+
+    if act:
+        return f"正在执行 {act[:20]}..." if len(act) > 22 else f"正在执行 {act}"
+
+    return "正在执行操作"
+
+async def _stream_typewriter_to_feishu(bot_reply_msg_id, full_text, user_text, think_seconds, feishu_call_fn, start_index=0, completed_steps_count=0, total_planned_steps=0, is_voice=False):
+    """Fast stream full_text onto Feishu interactive card without artificial delay."""
+    if not bot_reply_msg_id or not full_text:
+        return
+        
+    total_len = len(full_text)
+    if start_index >= total_len:
+        return
+        
+    remaining = total_len - start_index
+    if not is_voice:
+        # 文本模式：若剩余字符较少或已完整生成，直接一次性 patch 完成以保证极速响应
+        if remaining <= 1500:
+            card = CardBuilder.build_streaming_indicator(
+                full_text, tool_action=None, user_text=user_text, think_seconds=think_seconds,
+                completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
+            )
+            await feishu_call_fn(
+                lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
+                label="typewriter patch fast"
+            )
+            return
+        
+    chunk_size = 28 if is_voice else 1500
+    current_len = start_index
+    while current_len < total_len:
+        current_len += chunk_size
+        if current_len > total_len:
+            current_len = total_len
+            
+        typed_part = full_text[:current_len]
+        card = CardBuilder.build_streaming_indicator(
+            typed_part, tool_action=None, user_text=user_text, think_seconds=think_seconds,
+            completed_steps_count=completed_steps_count, total_planned_steps=total_planned_steps
+        )
+        
+        await feishu_call_fn(
+            lambda: patch_interactive_card_sdk(bot_reply_msg_id, card),
+            label="typewriter patch"
+        )
+        if is_voice and current_len < total_len:
+            await asyncio.sleep(0.12)
+
+
+def parse_transcript_turn(transcript_path, initial_size=0):
+    """
+    解析本轮对话在 transcript.jsonl 中的状态。
+    返回: (turn_lines, pending_tasks, is_turn_done)
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ([], set(), False)
+    try:
+        with open(transcript_path, 'r', encoding='utf-8', errors='ignore') as f:
+            if initial_size > 0:
+                try:
+                    f.seek(initial_size)
+                except Exception:
+                    pass
+            lines = f.readlines()
+        if not lines:
+            return ([], set(), False)
+
+        turn_lines = []
+        for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                data = json.loads(line_str)
+            except Exception:
+                continue
+            if data.get("type") == "USER_INPUT":
+                turn_lines = []
+            else:
+                turn_lines.append(data)
+
+        if not turn_lines:
+            return ([], set(), False)
+
+        # 检查 Background Tasks 状态
+        started_tasks = set()
+        finished_tasks = set()
+        for event in turn_lines:
+            content = event.get("content") or ""
+            if "Tool is running as a background task with task id:" in content or "task id:" in content:
+                for m in re.finditer(r'task id:\s*([^\s\n]+)', content):
+                    started_tasks.add(m.group(1).strip())
+            if 'Task id "' in content and "finished with result" in content:
+                for m in re.finditer(r'Task id\s*["\']([^"\']+)["\']\s+finished with result', content):
+                    finished_tasks.add(m.group(1).strip())
+            elif 'Task id "' in content and ("completed" in content or "failed" in content or "cancelled" in content):
+                for m in re.finditer(r'Task id\s*["\']([^"\']+)["\']\s+(?:completed|failed|cancelled)', content):
+                    finished_tasks.add(m.group(1).strip())
+
+        pending_tasks = started_tasks - finished_tasks
+        if pending_tasks:
+            return (turn_lines, pending_tasks, False)
+
+        # 检查最后一条事件是否已标记完成
+        last_event = turn_lines[-1]
+        is_done = False
+        if (last_event.get("source") == "MODEL" and 
+            last_event.get("type") == "PLANNER_RESPONSE" and 
+            last_event.get("status") == "DONE"):
+            tool_calls = last_event.get("tool_calls")
+            if not tool_calls or len(tool_calls) == 0:
+                is_done = True
+
+        return (turn_lines, pending_tasks, is_done)
+    except Exception as e:
+        log.error(f"parse_transcript_turn error: {e}")
+        return ([], set(), False)
+
+def extract_final_response_from_turn_lines(turn_lines):
+    """Extract only the final conclusion response from transcript turn lines.
+    Strictly excludes intermediate pre-tool commentary/thinking turns to prevent leaking background reasoning.
+    """
+    if not turn_lines:
+        return None
+    try:
+        final_non_tool_candidates = []
+        all_valid_candidates = []
+        for data in turn_lines:
+            if data.get("source") == "MODEL" and data.get("type") == "PLANNER_RESPONSE":
+                content = (data.get("content") or "").strip()
+                if not content:
+                    continue
+                clean_text = extract_final_chinese_response(content)
+                if not clean_text:
+                    continue
+                if (clean_text.startswith('Task "') or 
+                    clean_text.startswith('<task_update') or
+                    clean_text.startswith('The command exited with code') or
+                    'completed with exit code' in clean_text):
+                    continue
+                if not all_valid_candidates or all_valid_candidates[-1] != clean_text:
+                    all_valid_candidates.append(clean_text)
+                tool_calls = data.get("tool_calls")
+                if not tool_calls:
+                    if not final_non_tool_candidates or final_non_tool_candidates[-1] != clean_text:
+                        final_non_tool_candidates.append(clean_text)
+
+        if final_non_tool_candidates:
+            # Always return ONLY the final non-tool planner response, never concatenating earlier pre-tool thoughts!
+            return final_non_tool_candidates[-1]
+        if all_valid_candidates:
+            return all_valid_candidates[-1]
+        return None
+    except Exception as e:
+        log.error(f"extract_final_response_from_turn_lines error: {e}")
+        return None
+
+def extract_final_response_from_transcript(transcript_path, initial_size=0):
+    turn_lines, _, _ = parse_transcript_turn(transcript_path, initial_size)
+    return extract_final_response_from_turn_lines(turn_lines)
+
+def is_transcript_turn_completed(transcript_path, initial_size=0):
+    _, _, is_done = parse_transcript_turn(transcript_path, initial_size)
+    return is_done
+
+def extract_final_chinese_response(text):
+    if not text:
+        return ""
+    
+    # 0. 优先彻底移除成对闭合的任务规划标签块，开头未闭合流式行仅移除首行（避免正文中包含 `[TASK_PLAN]` 文本时截断后续全文）
+    text = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'\[/TASK_PLAN\]', '', text, flags=re.IGNORECASE).strip()
+
+    # 1. 移除被 XML 标签包裹的思考过程与思维链，如 <thought>...</thought>, <thinking>...</thinking>, <think>...</think>
+    # 以及流式分片导致缺少开标签但残留闭合标签 </thought> 之前的所有思考内容
+    text = re.sub(r'<(?:thought|thinking|think)>.*?</(?:thought|thinking|think)>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'^.*?</(?:thought|thinking|think)>\s*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'^<(?:thought|thinking|think)>.*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'```(?:thinking|thought)\b.*?```', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    
+    # 2. 移除 Task 执行日志 (例如 Task "timeout 15s bash ..." completed with exit code 0. Output: ...)
+    text = re.sub(r'Task\s+"[^"]*"\s+(?:completed|finished)\s+with\s+exit\s+code\s+\d+.*?(?:Output:\s*.*?)?(?=\n\n|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'<task_update\b.*?</task_update>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'<SYSTEM_MESSAGE>.*?</SYSTEM_MESSAGE>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # 3. 移除终端原始退出状态及控制台片段 (例如 The command exited with code 0. Output: ...)
+    text = re.sub(r'The command exited with code \d+\.?\s*(?:Output:\s*.*?)?(?=\n\n|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'Warning: Permanently added [^\n]+\n*', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'From https://github\.com/[^\n]+\n*', '', text, flags=re.IGNORECASE).strip()
+
+    # 4. 移除开头的常见英文规划与描述前缀 (例如 "I will...", "Sure, I will...", "Let me...", "Here is...", "I need to...")
+    text = re.sub(
+        r'^(?:I\s+will|Sure,?\s+I\s+will|Let\s+me|Here\s+is|I\s+need\s+to|Based\s+on)\s+.*?\n\n',
+        '',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    ).strip()
+
+    # 5. 移除单行英文申明 (例如 "I will respond in Simplified Chinese.", "Sure, I will analyze the codebase in Chinese.")
+    text = re.sub(
+        r'^(?:I\s+will|Sure,?\s+I\s+will|Let\s+me)\s+(?:report|summarize|explain|respond|write|reply|communicate|answer|check|analyze)\b.+?(?:in\s+(?:Simplified\s+)?Chinese|below)\.?\s*',
+        '',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    ).strip()
+
+    # 6. 移除包含 Thinking Process, Thought:, Plan:, Thinking:, 思考过程 等小标题的内部推理段落（支持跨多段英文思考清除）
+    text = re.sub(
+        r'^(?:\*\*|\#\#?\s*)?(?:Thinking Process|Internal Reasoning|Thought|Thinking)(?:\*\*|:)?\s*.*?(?=\n(?:\#|\*\*|[\u4e00-\u9fa5])|\Z)',
+        '',
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+    text = re.sub(r'(?:\*\*|\#\#?\s*)?(?:Thinking Process|Thought|Thinking|\bPlan\b|Reasoning|思考过程|内部推理)(?:\*\*|:|：)?\s*.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # 7. 移除内部消息包装 (例如 [Message] timestamp=... content=...)
+    text = re.sub(r'\[Message\]\s+timestamp=.*?content=.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL).strip()
+
+    # 8. 清理残留的动态思考占位符
+    text = re.sub(r'\*\(\s*(?:🧠|🔍|⚙️|💡|🚀)?\s*正在.*?\)\*', '', text).strip()
+
+    # 9. 再次清理成对任务规划标签防泄漏
+    text = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', text, flags=re.IGNORECASE).strip()
+
+    return text
+
+def extract_choice_card_data(reply_text, transcript_path=None, initial_transcript_size=0):
+    """
+    Extract interactive choice options from:
+    1. Explicit [CHOICE_CARD] Q: ... \n - opt1 \n - opt2 [/CHOICE_CARD] tags
+    2. 'ask_question' tool calls in transcript.jsonl
+    3. Intelligent heuristic extraction for solution patterns (e.g. 方案一/方案二, 方案 1/方案 2, 选项 A/选项 B)
+    Returns: (cleaned_reply_text, choice_card_dict_or_None)
+    """
+    if not reply_text:
+        return reply_text, None
+
+    # 1. 显式 [CHOICE_CARD] 标签优先匹配
+    choice_pattern = re.compile(r'\[CHOICE_CARD\]\s*Q:\s*(.*?)\n(.*?)\s*\[/CHOICE_CARD\]', re.DOTALL | re.IGNORECASE)
+    match = choice_pattern.search(reply_text)
+    if match:
+        question = match.group(1).strip()
+        options_text = match.group(2).strip()
+        options = [
+            opt.strip()[1:].strip() if opt.strip().startswith(('-', '•', '*')) else opt.strip() 
+            for opt in options_text.split('\n') if opt.strip()
+        ]
+        clean_text = choice_pattern.sub('', reply_text).strip()
+        if options:
+            return clean_text, {
+                "question": question or "请选择：",
+                "options": options
+            }
+
+    # 2. 从 transcript.jsonl 中捕获 ask_question 工具调用
+    if transcript_path and os.path.exists(transcript_path):
+        try:
+            with open(transcript_path, 'r', encoding='utf-8', errors='ignore') as f:
+                if initial_transcript_size > 0:
+                    try:
+                        f.seek(initial_transcript_size)
+                    except Exception:
+                        pass
+                lines = f.readlines()
+            for line in reversed(lines):
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    data = json.loads(line_str)
+                except Exception:
+                    continue
+                if data.get("type") == "USER_INPUT":
+                    break
+                tool_calls = data.get("tool_calls") or []
+                for tc in tool_calls:
+                    if isinstance(tc, dict) and tc.get("name") == "ask_question":
+                        args = tc.get("args", {})
+                        questions = args.get("questions", [])
+                        if questions and isinstance(questions, list):
+                            first_q = questions[0]
+                            q_text = first_q.get("question", "请选择：")
+                            opts = first_q.get("options", [])
+                            if opts:
+                                return reply_text, {
+                                    "question": q_text,
+                                    "options": [str(o) for o in opts]
+                                }
+        except Exception as e:
+            log.debug(f"Failed to extract ask_question from transcript: {e}")
+
+    # 3. 智能启发式探测：方案/选项列表抽取
+    heuristic_options = []
+    lines = reply_text.split('\n')
+    for line in lines:
+        stripped = line.strip()
+        # 匹配标题行或重点列表，例如：
+        # "### 方案一：采用外部独立网关"
+        # "### 方案 1: 热重载插件"
+        # "1. **方案一（推荐）**：使用插件热重载"
+        # "1. **方案 1**：修改配置"
+        # "• **选项 A**：保留现状"
+        m = re.match(
+            r'^(?:[#*`\s\d.、•-]*)(方案\s*[一二三四五六七八九十0-9A-Za-z]+|选项\s*[A-Za-z0-9一二三四五]+)(?:（[^）]+）|\([^\)]+\))?[:：.、\s]+(.*)$',
+            stripped
+        )
+        if m:
+            prefix = m.group(1).strip()
+            detail = m.group(2).strip().replace('*', '').replace('`', '').strip()
+            # 过滤超长说明段落，只保留简要核心
+            if len(detail) > 80:
+                detail = detail[:80] + "..."
+            opt_title = f"{prefix}: {detail}" if detail else prefix
+            if opt_title not in heuristic_options:
+                heuristic_options.append(opt_title)
+
+    if 2 <= len(heuristic_options) <= 6:
+        has_question_or_choice_intent = any(kw in reply_text for kw in [
+            "请选择", "哪种方案", "哪个方案", "如何选择", "选择哪种", "建议采用", "可供选择",
+            "方案一", "方案二", "方案 1", "方案 2", "您希望", "你希望", "选择如下", "以下方案",
+            "方案选择", "采用哪种", "点击下方", "可选择"
+        ])
+        if has_question_or_choice_intent:
+            return reply_text, {
+                "question": "🎯 请选择您希望采用的方案：",
+                "options": heuristic_options
+            }
+
+    return reply_text, None
+
+async def execute_zcode(
+    chat_id, user_text, message_id, bot_reply_msg_id, session_data, 
+    is_new_conversation, system_instruction, final_prompt, downloaded_file_name, 
+    download_success, running_processes, is_resumed=False, task_meta=None
+):
+    loop = asyncio.get_running_loop()
+    target_transcript_path = None
+
+    # Daily execution limit for non-admin chats.
+    if not allow_execution(chat_id):
+        err_card = CardBuilder.build_ai_response(
+            "⏳ 今日执行次数已达上限，请明天再试或联系管理员提升额度。",
+            is_error=True,
+        )
+        try:
+            if bot_reply_msg_id:
+                await _feishu_call(lambda: patch_interactive_card_sdk(bot_reply_msg_id, err_card), label="daily-limit patch")
+            else:
+                await _feishu_call(lambda: send_interactive_card_sdk(message_id, err_card), label="daily-limit send")
+        except Exception as e:
+            log.error(f"[Executor] daily limit card failed: {e}")
+        return True
+    
+    async def _feishu_call(sync_fn, timeout=30.0, label="feishu_call"):
+        """在线程池中执行同步飞书 SDK 调用，并加 30s 超时硬上限。
+        防止网络黑洞（NAT 会话挂起 / 中间设备静默丢包）让主循环无限阻塞。
+        超时或异常统一返回 None，调用方负责降级。"""
+        try:
+            return await asyncio.wait_for(
+                app_state.run_feishu_sync(loop, sync_fn),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            log.error(f"[Executor] {label} timed out after {timeout}s — network black-hole?")
+            return None
+        except Exception as e:
+            log.error(f"[Executor] {label} failed: {e}")
+            return None
+    
+    async def _sync_conversation_id_from_log(log_path):
+        """zcode 引擎下会话 ID 由协议 init 事件同步，此处仅保留兼容空实现。"""
+        nonlocal target_transcript_path
+        if not log_path or not os.path.exists(log_path):
+            return
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                log_content = f.read()
+            match = re.search(
+                r'(?:Created|found|resuming|Loaded|Streaming|Forwarding user message to|Sending user message to|conversation[=:\s]+|conversationID=)\s*(?:conversation\s+)?["\'\s]*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
+                log_content,
+                re.IGNORECASE
+            )
+            if match:
+                new_conv_id = match.group(1)
+                if session_data.get("conversation") != new_conv_id:
+                    session_data["conversation"] = new_conv_id
+                    try:
+                        await asyncio.wait_for(save_session_async(chat_id, session_data), timeout=3.0)
+                        log.info(f"[Executor] Synced and persisted conversation ID {new_conv_id} for chat {chat_id}")
+                    except (asyncio.TimeoutError, Exception) as e:
+                        log.error(f"save_session_async timed out or failed: {e}")
+                if not target_transcript_path:
+                    path = get_transcript_path(new_conv_id)
+                    if os.path.exists(path):
+                        target_transcript_path = path
+            elif re.search(r'Warning:\s*conversation\s+["\']?[0-9a-fA-F-]+["\']?\s+not\s+found', log_content, re.IGNORECASE):
+                if session_data.get("conversation") != "":
+                    log.warning(f"[Executor] Conversation {session_data.get('conversation')} not found in engine store, resetting.")
+                    session_data["conversation"] = ""
+                    try:
+                        await asyncio.wait_for(save_session_async(chat_id, session_data), timeout=3.0)
+                        log.info(f"[Executor] Conversation not found in log, reset conversation ID for chat {chat_id}")
+                    except (asyncio.TimeoutError, Exception) as e:
+                        log.error(f"save_session_async timed out or failed: {e}")
+        except Exception as e:
+            log.error(f"Failed to sync conversation id from log: {e}")
+
+    async def _run_single_attempt(attempt):
+        nonlocal bot_reply_msg_id, target_transcript_path
+        logs_dir = os.path.abspath(os.path.join(BASE_DIR, "logs"))
+        os.makedirs(logs_dir, exist_ok=True)
+        # zcode 引擎：无一次性 CLI 进程；长驻 app-server 会话由 session_pool 管理。
+        # log_file_path 仅作兼容哨兵（os.path.exists("") == False，全部日志分支自动跳过）。
+        log_file_path = ""
+        from system_one_gate import infer_effort_from_model
+        safe_model = session_data["model"]
+        safe_effort = infer_effort_from_model(safe_model, session_data.get("reasoning_effort", "medium"))
+        if not zcode_engine_argv():
+            err_card = CardBuilder.build_ai_response(
+                "❌ **zcode 引擎未找到**\n\n请先安装 ZCode（Desktop 或 CLI），或在 `.env` 中设置 `ZCODE_BIN` 指向 zcode 可执行文件。",
+                is_error=True,
+            )
+            try:
+                if bot_reply_msg_id:
+                    await _feishu_call(lambda: patch_interactive_card_sdk(bot_reply_msg_id, err_card), label="no-engine patch")
+                else:
+                    await _feishu_call(lambda: send_interactive_card_sdk(message_id, err_card), label="no-engine send")
+            except Exception as e:
+                log.error(f"[Executor] no-engine card failed: {e}")
+            return {"has_reply": True, "returncode": -1, "is_error": True, "is_quota_error": False}
+
+        is_admin_chat = is_admin(chat_id)
+        cwd_dir = None
+        allow_project = is_admin_chat or has_scope(chat_id, SCOPE_PROJECT)
+        if allow_project and session_data.get("project") and session_data["project"] not in ["默认", "Default"]:
+            proj_val = session_data["project"]
+            if os.path.isdir(proj_val):
+                cwd_dir = proj_val
+
+        cur_is_new_conv = (is_new_conversation and attempt == 1) or not session_data.get("conversation")
+            
+        target_transcript_path = None
+        initial_transcript_size = 0
+        if session_data.get("conversation"):
+            conv_id = session_data["conversation"]
+            path = get_transcript_path(conv_id)
+            if os.path.exists(path):
+                target_transcript_path = path
+                initial_transcript_size = os.path.getsize(path)
+
+        custom_env = os.environ.copy()
+        custom_env["GIT_TERMINAL_PROMPT"] = "0"
+        custom_env["DEBIAN_FRONTEND"] = "noninteractive"
+        custom_env["GIT_ASKPASS"] = "echo"
+        custom_env["PYTHONUNBUFFERED"] = "1"
+        custom_env["STDOUT_LINE_BUFFERED"] = "1"
+        sess_locked = False
+        turn_stream = None
+        pool_key = session_data.get("_isolated_pool_key") or chat_id
+        try:
+            from session_pool import session_pool
+            conv_id_to_resume = session_data.get("conversation", "") if not is_new_conversation else ""
+            sess = session_pool.get_or_create(
+                pool_key,
+                safe_model,
+                cwd_dir,
+                conversation_id=conv_id_to_resume,
+                effort=safe_effort,
+            )
+            await sess.lock.acquire()
+            sess_locked = True
+            if not sess.is_alive():
+                try:
+                    await sess.start()
+                except FileNotFoundError as e:
+                    engine_err_card = CardBuilder.build_ai_response(
+                        f"❌ **zcode 引擎未找到**\n\n{e}\n\n请安装 ZCode（Desktop 或 CLI），或在 `.env` 中设置 `ZCODE_BIN`，然后重启机器人。",
+                        is_error=True,
+                    )
+                    if bot_reply_msg_id:
+                        await _feishu_call(lambda: patch_interactive_card_sdk(bot_reply_msg_id, engine_err_card), label="engine-missing patch")
+                    else:
+                        await _feishu_call(lambda: send_interactive_card_sdk(message_id, engine_err_card), label="engine-missing send")
+                    session_data["last_execution_error"] = True
+                    return {"has_reply": True, "returncode": -1, "is_error": True, "is_quota_error": False}
+                except Exception as e:
+                    err_text = str(e)
+                    if "Provider Registry" in err_text or "Select a model" in err_text:
+                        hint = (
+                            "🔑 **zcode 引擎尚未登录 Z.ai 账号**\n\n"
+                            "请在宿主机终端执行一次（浏览器点击授权即可）：\n"
+                            "`bash engine_login.sh`\n\n"
+                            "授权完成后**无需重启机器人**，直接重新发送消息即可。"
+                        )
+                    else:
+                        hint = f"❌ **引擎会话启动失败**\n\n`{err_text[:300]}`"
+                    engine_err_card = CardBuilder.build_ai_response(hint, is_error=True)
+                    if bot_reply_msg_id:
+                        await _feishu_call(lambda: patch_interactive_card_sdk(bot_reply_msg_id, engine_err_card), label="engine-error patch")
+                    else:
+                        await _feishu_call(lambda: send_interactive_card_sdk(message_id, engine_err_card), label="engine-error send")
+                    session_data["last_execution_error"] = True
+                    return {"has_reply": True, "returncode": -1, "is_error": True, "is_quota_error": False}
+            process = sess.process
+            running_processes[pool_key] = process
+            
+            planned_steps = []
+            current_plan_idx = 0
+            is_voice_message = bool(
+                task_meta and (
+                    task_meta.get("message_type") == "audio" or 
+                    task_meta.get("is_voice_message")
+                )
+            )
+
+            if attempt == 1:
+                if is_resumed:
+                    init_card = CardBuilder.build_typing_indicator(
+                        downloaded_file_name, download_success,
+                        f"🔄 检测到服务刚完成重启，正在自动继续执行未完成的任务...\n\n{user_text}",
+                        is_voice=is_voice_message
+                    )
+                else:
+                    init_card = CardBuilder.build_typing_indicator(
+                        downloaded_file_name, download_success, user_text, is_voice=is_voice_message
+                    )
+            else:
+                init_card = CardBuilder.build_typing_indicator(
+                    downloaded_file_name, download_success,
+                    f"🔄 首次发起因无响应挂死，正在自动为您重新发起第 {attempt}/2 次重试...\n\n{user_text}",
+                    is_voice=is_voice_message
+                )
+
+            if bot_reply_msg_id:
+                if attempt > 1 or is_resumed:
+                    await _feishu_call(
+                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, init_card),
+                        label=f"init-card patch attempt {attempt}"
+                    )
+            else:
+                new_id = await _feishu_call(
+                    lambda: send_interactive_card_sdk(message_id, init_card),
+                    label=f"init-card send attempt {attempt}"
+                )
+                if new_id:
+                    bot_reply_msg_id = new_id
+                    if task_meta is not None:
+                        task_meta["bot_reply_msg_id"] = new_id
+                        try:
+                            from database import save_pending_task
+                            save_pending_task(chat_id, task_meta)
+                        except Exception:
+                            pass
+                else:
+                    log.warning(f"[Executor] Initial typing card send failed for chat {chat_id}; will fall back to sending final card as new message")
+            
+            accumulated_text = ""
+            current_turn_text = ""
+            stderr_text = ""
+            stream_result_response = None
+            stream_error_msg = ""
+            stream_action = ""
+            stream_is_done = False
+            is_quota_exhausted = False
+
+            def get_latest_transcript_file():
+                if session_data.get("conversation"):
+                    conv_id = session_data["conversation"]
+                    path = get_transcript_path(conv_id)
+                    if os.path.exists(path):
+                        return path
+                brain_dir = get_brain_dir()
+                if os.path.exists(brain_dir):
+                    try:
+                        for entry in os.listdir(brain_dir):
+                            entry_path = os.path.join(brain_dir, entry)
+                            if os.path.isdir(entry_path) and (len(entry) == 36 or (entry.startswith("sess_") and len(entry) == 41)):
+                                fp = os.path.join(entry_path, ".system_generated", "logs", "transcript.jsonl")
+                                if os.path.exists(fp):
+                                    mtime = os.path.getmtime(fp)
+                                    if mtime >= process_start_time - 2:
+                                        return fp
+                    except Exception:
+                        pass
+                return None
+
+            last_streamed_length = 0
+            last_patch_time = time.time()
+            process_start_time = time.time()
+            last_progress_time = process_start_time
+            last_cpu_check_time = 0
+            is_worker_active = False
+            active_worker_reason = "idle"
+            active_worker_list = []
+            process_status_info = {"active": False, "status_desc": "", "workers": [], "detail_cmd": ""}
+            tool_in_flight_start_time = None
+            last_tool_action = ""
+            completed_tool_steps = []
+            current_tool_action = ""
+            current_tool_name = ""
+            typesafe_tool_audits = []
+            typesafe_blocked_info = None
+            evaluated_tool_calls = set()
+            last_patched_card_sig = ""
+            
+            # 从配置中读取超时配置，支持自定义配置并设置合理防御值
+            BASE_STALL_TIMEOUT = getattr(config, "STALL_TIMEOUT", 600)
+            BASE_STALL_HARD_TIMEOUT = getattr(config, "STALL_HARD_TIMEOUT", 3600)
+            BASE_TOOL_TIMEOUT = getattr(config, "TOOL_EXECUTION_TIMEOUT", 3600)
+            BASE_QUIET_WARNING_THRESHOLD = 120
+            TOOL_QUIET_WARNING_THRESHOLD = 300
+
+            # Snapshot warm-pool baseline PIDs BEFORE sending the turn prompt so pre-existing sleeping children never fool the watchdog
+            from math_decision_model import ProcessVitalityState, snapshot_process_group_pids
+            vitality_state = ProcessVitalityState(
+                baseline_pids=snapshot_process_group_pids(process.pid) if process and process.pid else set()
+            )
+
+            turn_stream = await sess.send_prompt_and_stream(system_instruction + final_prompt)
+
+            while True:
+                event_data = await turn_stream.get_event(timeout=0.2)
+                now = time.time()
+
+                events_to_process = [event_data] if event_data else []
+                if hasattr(turn_stream, "drain_all"):
+                    events_to_process.extend(turn_stream.drain_all())
+
+                should_break = False
+                for ev in events_to_process:
+                    last_progress_time = now
+                    event_type = ev.get("event")
+                    if event_type == "init":
+                        conv_id = ev.get("conversation_id")
+                        if conv_id:
+                            from session_pool import session_pool
+                            session_pool.update_conversation_id(chat_id, conv_id)
+                            if session_data.get("conversation") != conv_id:
+                                session_data["conversation"] = conv_id
+                                try:
+                                    await asyncio.wait_for(save_session_async(chat_id, session_data), timeout=2.0)
+                                except Exception:
+                                    pass
+                                path = get_transcript_path(conv_id)
+                                if os.path.exists(path):
+                                    target_transcript_path = path
+                                    if initial_transcript_size == 0:
+                                        initial_transcript_size = os.path.getsize(path)
+                    elif event_type == "step_update":
+                        step_up = ev.get("step_update", {})
+                        step_t = step_up.get("step_type")
+                        if step_t == "agent_response":
+                            delta = step_up.get("text_delta")
+                            if delta:
+                                accumulated_text += delta
+                                current_turn_text += delta
+                                parsed_steps = CardBuilder.parse_task_plan(accumulated_text)
+                                if parsed_steps and parsed_steps != planned_steps:
+                                    planned_steps = parsed_steps
+                                    current_plan_idx = min(current_plan_idx, len(planned_steps) - 1)
+                            if current_tool_action:
+                                if current_tool_action not in completed_tool_steps:
+                                    completed_tool_steps.append(current_tool_action)
+                                current_tool_action = ""
+                                stream_action = ""
+                                current_tool_name = ""
+                                tool_in_flight_start_time = None
+                        elif step_t == "tool":
+                            t_state = step_up.get("state", "ACTIVE")
+                            t_name = step_up.get("tool_name") or step_up.get("name") or ""
+                            t_info = step_up.get("tool_info", {})
+                            if not isinstance(t_info, dict):
+                                t_info = {}
+                            t_params = t_info.get("parameters") or t_info.get("args") or step_up.get("parameters") or step_up.get("args") or {}
+                            if not isinstance(t_params, dict):
+                                t_params = {}
+                            act = format_tool_action(t_name, t_params)
+
+                            # Isolate turn buffer: any text emitted BEFORE a tool invocation is transitional pre-tool thinking/commentary,
+                            # so clear current_turn_text so only post-tool final conclusion text is delivered as final_reply!
+                            if current_turn_text:
+                                parsed_steps = CardBuilder.parse_task_plan(accumulated_text)
+                                if parsed_steps and parsed_steps != planned_steps:
+                                    planned_steps = parsed_steps
+                                current_turn_text = ""
+
+                            # Guarantee 3-4 step planned roadmap even if model omitted [TASK_PLAN]
+                            if not planned_steps:
+                                planned_steps = CardBuilder.generate_task_plan(user_text)[:4]
+                                current_plan_idx = 0
+
+                            if t_state == "DONE":
+                                if act and act not in completed_tool_steps:
+                                    completed_tool_steps.append(act)
+                                elif current_tool_action and current_tool_action not in completed_tool_steps:
+                                    completed_tool_steps.append(current_tool_action)
+                                current_tool_action = ""
+                                stream_action = ""
+                                current_tool_name = ""
+                                tool_in_flight_start_time = None
+                            else:
+                                if act:
+                                    if current_tool_action and act != current_tool_action:
+                                        if current_tool_action not in completed_tool_steps:
+                                            completed_tool_steps.append(current_tool_action)
+                                    current_tool_action = act
+                                    stream_action = act
+                                    last_tool_action = act
+                                    current_tool_name = t_name
+                                    if tool_in_flight_start_time is None:
+                                        tool_in_flight_start_time = now
+                                    if planned_steps:
+                                        current_plan_idx = CardBuilder.match_step_index(
+                                            planned_steps, current_plan_idx, act, len(completed_tool_steps)
+                                        )
+                                # Co-Pilot 对高风险工具事件进行语义复核；普通工具由本地规则和 CLI 沙箱保护。
+                                ts_tier = getattr(config, "TYPESAFE_TIER", "gateway") or "gateway"
+                                if ts_tier == "copilot" and getattr(config, "TYPESAFE_ENABLED", True):
+                                    cmd_target = (t_params.get("CommandLine") or t_params.get("command") or "").strip()
+                                    if not cmd_target:
+                                        if t_name in ["write_to_file", "replace_file_content"]:
+                                            cmd_target = f"{t_name} target={t_params.get('TargetFile', '')}"
+                                        elif t_name:
+                                            cmd_target = f"tool:{t_name}"
+                                    call_key = step_up.get("call_id") or step_up.get("tool_call_id") or f"{t_name}:{cmd_target[:100]}"
+                                    if call_key and call_key not in evaluated_tool_calls and cmd_target:
+                                        evaluated_tool_calls.add(call_key)
+                                        try:
+                                            from system_one_gate import evaluate_tool_execution
+                                            tool_dec = await evaluate_tool_execution(command=cmd_target, context=f"act={act}")
+                                            if tool_dec.decision_source == "jev":
+                                                session_data["typesafe_decision_count"] = session_data.get("typesafe_decision_count", 0) + 1
+                                            if not tool_dec.is_allowed:
+                                                log.critical(f"[TypeSafe Co-Pilot] High-risk tool event intercepted: {cmd_target} -> {tool_dec.reason}")
+                                                typesafe_blocked_info = {
+                                                    "tool": t_name,
+                                                    "target": cmd_target,
+                                                    "reason": tool_dec.reason or "安全策略拒绝了该高风险操作",
+                                                    "risk_level": tool_dec.risk_level,
+                                                    "call_id": call_key,
+                                                    "cwd": session_data.get("project") or ""
+                                                }
+                                                await sess.close()
+                                                should_break = True
+                                                break
+                                            else:
+                                                typesafe_tool_audits.append({
+                                                    "tool": t_name,
+                                                    "risk": tool_dec.risk_level,
+                                                    "latency_ms": tool_dec.latency_ms
+                                                })
+                                        except Exception as e:
+                                            log.warning(f"[TypeSafe Co-Pilot] Tool execution evaluation error: {e}")
+                                            typesafe_blocked_info = {
+                                                "tool": t_name,
+                                                "target": cmd_target,
+                                                "reason": "高风险工具检查异常，已停止后续执行",
+                                                "risk_level": "critical_risk",
+                                                "call_id": call_key,
+                                                "cwd": session_data.get("project") or ""
+                                            }
+                                            await sess.close()
+                                            should_break = True
+                                            break
+                                if act:
+                                    from plugin_manager import plugin_manager
+                                    await plugin_manager.dispatch_tool_call(act, {})
+                    elif event_type == "result":
+                        if current_tool_action:
+                            if current_tool_action not in completed_tool_steps:
+                                completed_tool_steps.append(current_tool_action)
+                            current_tool_action = ""
+                        if planned_steps:
+                            current_plan_idx = len(planned_steps) - 1
+                        res_obj = ev.get("result", {})
+                        if isinstance(res_obj, dict):
+                            if res_obj.get("status") == "SUCCESS":
+                                stream_result_response = res_obj.get("response")
+                                stream_is_done = True
+                                log.info(f"[Executor] Model turn completed via stream result event.")
+                            else:
+                                stream_error_msg = str(res_obj.get("error") or res_obj.get("message") or "")
+                                log.warning(f"[Executor] Model turn finished with status: {res_obj.get('status')}, error: {stream_error_msg}")
+                        else:
+                            log.warning(f"[Executor] Model turn finished with non-dict result: {res_obj}")
+                        should_break = True
+                        break
+                    elif event_type in ["process_exit", "read_error", "error", "turn_error", "cancelled", "fatal"]:
+                        stream_error_msg = str(ev.get("error") or ev.get("message") or "")
+                        log.warning(f"[Executor] Stream ended with {event_type}: {ev}")
+                        should_break = True
+                        break
+                    elif event_type == "raw_log":
+                        # Never append non-JSON raw stdout log lines into user-facing response text!
+                        raw_line = ev.get("text", "")
+                        if raw_line:
+                            stderr_text = f"{stderr_text}\n{raw_line}".strip()[-16384:]
+
+                if should_break or stream_is_done:
+                    break
+
+                think_seconds = int(now - process_start_time)
+                stall_seconds = int(now - last_progress_time)
+
+                if os.path.exists(log_file_path):
+                    await _sync_conversation_id_from_log(log_file_path)
+
+                # 进程树状态与心跳检测（每 2 秒采集一次，基于 HMDM I/O + CPU + 非基线子进程活性）
+                if now - last_cpu_check_time >= 2.0:
+                    last_cpu_check_time = now
+                    worker_status = await loop.run_in_executor(
+                        None, lambda: _is_process_group_active(process.pid, vitality_state=vitality_state)
+                    )
+                    is_worker_active = worker_status.get("active", False)
+                    active_worker_reason = worker_status.get("reason", "idle")
+                    active_worker_list = worker_status.get("workers", [])
+                    process_status_info = worker_status
+
+                    # 仅当检测到真实 CPU/IO 脉冲或本轮新派生的活跃子进程时才刷新进度计时器
+                    if is_worker_active:
+                        last_progress_time = now
+                        stall_seconds = 0
+
+                # 动态计算等待与硬上限阈值
+                extend_until = app_state.extended_wait_chats.get(chat_id, 0)
+                extended_bonus = max(0, int(extend_until - now)) if extend_until > now else 0
+                
+                FAST_LOCAL_TOOLS = {"view_file", "write_to_file", "replace_file_content", "search_web", "read_url_content", "ask_question", "schedule"}
+                is_fast_tool = bool(current_tool_name in FAST_LOCAL_TOOLS or any(k in current_tool_action for k in ["查看", "读取", "搜索", "写入", "编辑"]))
+                tool_elapsed = (now - tool_in_flight_start_time) if tool_in_flight_start_time else 0
+                has_tool_in_flight = bool(current_tool_action or stream_action) and not is_fast_tool and (is_worker_active or tool_elapsed < 180)
+                
+                # 若工具正在真实执行（例如编译、云端打包、测试运行），基准等待时长使用 TOOL_EXECUTION_TIMEOUT
+                THINK_STALL_TIMEOUT = getattr(config, "THINK_STALL_TIMEOUT", 300)
+                if has_tool_in_flight or is_worker_active:
+                    effective_stall_timeout = BASE_TOOL_TIMEOUT + extended_bonus
+                    effective_stall_hard_timeout = max(BASE_STALL_HARD_TIMEOUT, BASE_TOOL_TIMEOUT) + extended_bonus
+                elif vitality_state.ewma_vitality < 0.005:
+                    # HMDM Layer 4B: 当 EWMA 活性指数衰减至 < 0.005 且无在途工具时，120s 极速识别假活死锁并触发自愈重试
+                    effective_stall_timeout = min(BASE_STALL_TIMEOUT, THINK_STALL_TIMEOUT) + extended_bonus
+                    effective_stall_hard_timeout = BASE_STALL_HARD_TIMEOUT + extended_bonus
+                else:
+                    effective_stall_timeout = BASE_STALL_TIMEOUT + extended_bonus
+                    effective_stall_hard_timeout = BASE_STALL_HARD_TIMEOUT + extended_bonus
+
+                # 假死判定逻辑：移除 think_seconds >= effective_stall_timeout 的冗余前置限制，只要静默卡死达到阈值立即自愈
+                if stall_seconds >= effective_stall_timeout:
+                    # 即使 stall_seconds 达到阈值，只要进程树仍有活跃编译/网络子进程，且未突破硬上限，绝不误杀！
+                    if is_worker_active and stall_seconds < effective_stall_hard_timeout:
+                        worker_desc = f" [{', '.join(active_worker_list[:3])}]" if active_worker_list else ""
+                        log.info(f"[Executor] No event for {stall_seconds}s but workers active ({active_worker_reason}{worker_desc}), extending wait")
+                    else:
+                        log.error(f"[Executor] Process stalled for chat {chat_id} (stall={stall_seconds}s, vitality={vitality_state.ewma_vitality:.4f}, limit={effective_stall_timeout}s), closing session...")
+                        await sess.close()
+                        if attempt < 2 and not completed_tool_steps:
+                            log.warning(f"[Executor] Turn stalled on attempt {attempt}; triggering automatic self-healing retry (attempt 2/2)...")
+                            return {"has_reply": False, "returncode": -9, "is_error": True, "is_quota_error": False}
+                        error_card = CardBuilder.build_stall_error_card(user_text, think_seconds, stall_seconds)
+                        if bot_reply_msg_id:
+                            await _feishu_call(
+                                lambda: patch_interactive_card_sdk(bot_reply_msg_id, error_card),
+                                label="stall error card patch"
+                            )
+                        stderr_text = f"⚠️ 任务已检测到假死并自动终止（连续 {stall_seconds // 60} 分钟没有任何输出、进程树无任何 CPU/IO 活跃且无任何工具在运行）。"
+                        session_data["last_execution_error"] = True
+                        return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
+
+                if think_seconds > 43200:
+                    log.error(f"[Executor] Process timeout reached (43200s / 12h) for chat {chat_id}...")
+                    await sess.close()
+                    stderr_text = "⚠️ 执行超时 (12小时)：后台超大型任务已达到系统设定的 12 小时最高保护上限。"
+                    session_data["last_execution_error"] = True
+                    return {"has_reply": True, "reply_text": stderr_text, "is_error": True}
+
+                has_active_tool = bool(current_tool_action or stream_action or last_tool_action or completed_tool_steps or has_tool_in_flight)
+                effective_warning_threshold = TOOL_QUIET_WARNING_THRESHOLD if has_active_tool else BASE_QUIET_WARNING_THRESHOLD
+                effective_warning_threshold += extended_bonus
+
+                clean_partial = ""
+                active_stream_buf = current_turn_text if current_turn_text.strip() else (accumulated_text if not completed_tool_steps else "")
+                if active_stream_buf and active_stream_buf.strip():
+                    raw_extracted = extract_final_chinese_response(active_stream_buf.strip())
+                    if raw_extracted:
+                        cp = re.sub(r'\[CHOICE_CARD\]\s*Q:.*?(?:\[/CHOICE_CARD\]|\Z)', '', raw_extracted, flags=re.DOTALL | re.IGNORECASE).strip()
+                        cp = re.sub(r'\[TASK_PLAN\].*?\[/TASK_PLAN\]\s*', '', cp, flags=re.DOTALL | re.IGNORECASE).strip()
+                        cp = re.sub(r'^\s*\[TASK_PLAN\][^\n]*(?:\n|$)', '', cp, flags=re.IGNORECASE).strip()
+                        clean_partial = cp.strip()
+
+                has_tool_in_flight = bool(current_tool_action or stream_action)
+                is_complex = bool(planned_steps or completed_tool_steps)
+
+                # 判定是否切换到打字机文本流式输出：
+                # 1. 如果工具正在执行中，绝对不切换，保持显示规划步骤/工具进度卡片；
+                # 2. 如果是纯问答无工具任务，只要有文本输出立即打字机流式呈现；
+                # 3. 如果是多步骤复杂任务，仅在所有工具执行完毕、且模型输出实质性总结文本（>=25字）时才切换至打字机
+                is_streaming_text = False
+                guard_before_delivery = (
+                    config.TYPESAFE_ENABLED
+                    and config.TYPESAFE_TIER in ("sentry", "copilot")
+                )
+                if clean_partial and not has_tool_in_flight:
+                    if is_voice_message:
+                        # 语音对话模式：流式生成期间不提前打字剧透，优先保证语音消息首先送达
+                        is_streaming_text = False
+                    elif guard_before_delivery:
+                        # Do not expose unreviewed text; final output is checked before delivery.
+                        is_streaming_text = False
+                    elif not is_complex:
+                        is_streaming_text = True
+                    else:
+                        min_chars = 15 if (planned_steps and current_plan_idx >= len(planned_steps) - 1) else 25
+                        if len(clean_partial) >= min_chars:
+                            if planned_steps:
+                                current_plan_idx = len(planned_steps) - 1
+                            is_streaming_text = True
+
+                desired_patch_interval = 0.20
+                if is_streaming_text:
+                    display_partial = clean_partial
+                    last_streamed_length = len(clean_partial)
+                    indicator_card = CardBuilder.build_streaming_indicator(
+                        display_partial,
+                        None,
+                        user_text,
+                        think_seconds,
+                        completed_steps_count=len(completed_tool_steps),
+                        total_planned_steps=len(planned_steps) if planned_steps else 0
+                    )
+                    desired_patch_interval = 0.20
+                elif stall_seconds >= effective_warning_threshold and not is_worker_active and not has_tool_in_flight:
+                    indicator_card = CardBuilder.build_stall_warning_card(user_text, think_seconds, stall_seconds)
+                    desired_patch_interval = 2.0
+                else:
+                    active_action = current_tool_action or stream_action
+                    display_action = active_action or (last_tool_action if not planned_steps else "")
+                    if display_action or completed_tool_steps or planned_steps:
+                        indicator_card = CardBuilder.build_tool_indicator(
+                            display_action,
+                            user_text,
+                            downloaded_file_name,
+                            download_success,
+                            think_seconds,
+                            completed_steps=completed_tool_steps,
+                            planned_steps=planned_steps,
+                            current_step_idx=current_plan_idx,
+                            process_status=process_status_info
+                        )
+                    else:
+                        indicator_card = CardBuilder.build_typing_indicator(
+                            downloaded_file_name, download_success, user_text, think_seconds, is_voice=is_voice_message
+                        )
+                    desired_patch_interval = 0.25
+
+                card_sig = str(indicator_card.get("elements", []))
+                if (card_sig != last_patched_card_sig) and (time.time() - last_patch_time >= desired_patch_interval):
+                    last_patch_time = time.time()
+                    last_patched_card_sig = card_sig
+                    if bot_reply_msg_id:
+                        await _feishu_call(
+                            lambda: patch_interactive_card_sdk(bot_reply_msg_id, indicator_card),
+                            label="indicator patch"
+                        )
+            await turn_stream.aclose()
+
+            if hasattr(sess, "get_recent_stderr"):
+                recent_err = sess.get_recent_stderr().strip()
+                if recent_err:
+                    stderr_text = f"{stderr_text}\n{recent_err}".strip() if stderr_text else recent_err
+
+            is_error = (process.returncode != 0 and process.returncode is not None)
+            session_data["last_execution_error"] = is_error
+
+            if typesafe_blocked_info:
+                is_error = False
+                session_data["last_execution_error"] = False
+                session_data["typesafe_audit_summary"] = "⚡️S1：L3全流程决策 · 高危操作待审批"
+                try:
+                    await asyncio.wait_for(save_session_async(chat_id, session_data), timeout=2.0)
+                except Exception:
+                    pass
+
+                confirm_card = CardBuilder.build_l3_high_risk_confirm_card(
+                    tool_name=typesafe_blocked_info.get("tool", "run_command"),
+                    command=typesafe_blocked_info.get("target", ""),
+                    risk_level=typesafe_blocked_info.get("risk_level", "critical_risk"),
+                    reason=typesafe_blocked_info.get("reason", ""),
+                    chat_id=chat_id,
+                    project_dir=typesafe_blocked_info.get("cwd", session_data.get("project", "")),
+                    call_id=typesafe_blocked_info.get("call_id", "")
+                )
+                if bot_reply_msg_id:
+                    await _feishu_call(
+                        lambda: patch_interactive_card_sdk(bot_reply_msg_id, confirm_card),
+                        label="patch l3 confirm card"
+                    )
+                else:
+                    await _feishu_call(
+                        lambda: send_interactive_card_sdk(message_id, confirm_card),
+                        label="send l3 confirm card"
+                    )
+                final_reply = None
+                accumulated_text = ""
+
+
+            transcript_path = target_transcript_path or await loop.run_in_executor(None, get_latest_transcript_file)
+
+            # 优先从本轮最后一阶段（工具调用结束后）的 current_turn_text / 最终 result / transcript 中提取回答，
+            # 彻底杜绝将多步工具调用前序轮次的过渡推理（Thinking/Chatter）拼接到最终结果中！
+            if typesafe_blocked_info:
+                pass
+            elif current_turn_text and current_turn_text.strip():
+                final_reply = current_turn_text.strip()
+            elif stream_result_response and stream_result_response.strip():
+                tx_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
+                final_reply = tx_reply if (tx_reply and completed_tool_steps) else stream_result_response.strip()
+            elif accumulated_text and accumulated_text.strip():
+                tx_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
+                final_reply = tx_reply if tx_reply else accumulated_text.strip()
+            else:
+                final_reply = extract_final_response_from_transcript(transcript_path, initial_transcript_size)
+            
+            # 探测是否由于模型配额耗尽导致报错或无回答
+            from utils.quota import detect_and_format_quota_error
+            combined_err_text = f"{stream_error_msg}\n{stderr_text}\n{accumulated_text}".strip()
+            quota_err_reply = None
+            if not final_reply or final_reply == "Sorry, I couldn't generate a response.":
+                quota_err_reply = await detect_and_format_quota_error(combined_err_text, model=session_data.get("model", ""))
+                if quota_err_reply:
+                    is_quota_exhausted = True
+                    final_reply = quota_err_reply
+
+            # 若提取最终回答失败且进程非正常退出（如 API 抖动 EOF、卡死强死、进程崩溃），且非配额用尽，且在允许重试范围内：
+            # 暂不向飞书推送报错卡片，直接返回 has_reply=False 触发自动重试机制！
+            if not is_quota_exhausted and not final_reply and (process.returncode != 0 and process.returncode is not None) and attempt < 2:
+                log.warning(f"[Executor] Attempt {attempt} failed without final response (returncode {process.returncode}). Bypassing error card send for auto-retry.")
+                return {"has_reply": False, "returncode": process.returncode, "is_error": True, "is_quota_error": False}
+            
+            reply_text = final_reply or accumulated_text.strip() or ""
+            reply_text = re.sub(r'^Warning: conversation ".*?" not found\.?\r?\n*', '', reply_text).strip()
+            reply_text = re.sub(r'\[Message\] timestamp=.*?content=.*?(?=\n\n|\Z)', '', reply_text, flags=re.DOTALL).strip()
+            if not is_quota_exhausted and not typesafe_blocked_info:
+                reply_text = extract_final_chinese_response(reply_text)
+
+            from plugin_manager import plugin_manager
+            reply_text = await plugin_manager.dispatch_after_ai(reply_text, chat_id, session_data)
+
+            # Level 3 (Co-Pilot): 任务执行异常时的自愈根因诊断
+            if is_error and not is_quota_exhausted and not typesafe_blocked_info:
+                if getattr(config, "TYPESAFE_TIER", "gateway") == "copilot" and getattr(config, "TYPESAFE_ENABLED", True):
+                    try:
+                        from system_one_gate import evaluate_tool_error
+                        err_target = last_tool_action or (completed_tool_steps[-1] if completed_tool_steps else "unknown_tool")
+                        raw_err = stream_error_msg or stderr_text or reply_text[:300]
+                        if raw_err:
+                            diag_res = await evaluate_tool_error(command=str(err_target), error_output=raw_err)
+                            if diag_res and not diag_res.is_fallback:
+                                session_data["typesafe_decision_count"] = session_data.get("typesafe_decision_count", 0) + 1
+                                diag_note = (
+                                    f"\n\n🔍 **[System One 故障诊断]**\n"
+                                    f"- **故障分类**：`{diag_res.error_category}` (置信度 {diag_res.confidence:.0%})\n"
+                                    f"- **排查建议**：{diag_res.suggestion}"
+                                )
+                                if diag_note not in reply_text:
+                                    reply_text = (reply_text + diag_note).strip()
+                    except Exception as diag_e:
+                        log.warning(f"[TypeSafe Co-Pilot] evaluate_tool_error in executor failed: {diag_e}")
+            
+            if not is_quota_exhausted and transcript_path and os.path.exists(transcript_path):
+                try:
+                    with open(transcript_path, 'r', encoding='utf-8') as f:
+                        f.seek(initial_transcript_size)
+                        for line in f.readlines():
+                            try:
+                                data = json.loads(line)
+                                if data.get("type") == "GENERATE_IMAGE" or "generate_image" in line:
+                                    match = re.search(r'Generated image is saved at (.*?\.(?:jpg|png|jpeg))', data.get("content", ""))
+                                    if match:
+                                        img_path = match.group(1)
+                                        if img_path not in reply_text:
+                                            reply_text += f"\n\n![Generated Image]({img_path})"
+                            except Exception:
+                                pass
+                except Exception as e:
+                    log.error(f"Failed to extract generated images from transcript: {e}")
+            
+            if not is_quota_exhausted and reply_text:
+                active_project = session_data.get("project")
+                ws_root = session_data.get("workspace_root")
+                allowed_dirs = [active_project, ws_root]
+                
+                await _feishu_call(
+                    lambda: extract_and_upload_resources(reply_text, message_id, api_client, allowed_dirs, chat_id=chat_id),
+                    timeout=120.0,
+                    label="extract_and_upload_resources"
+                )
+                
+                if os.path.exists(log_file_path):
+                    await _sync_conversation_id_from_log(log_file_path)
+                
+                is_error = False
+
+            if not reply_text:
+                if not quota_err_reply:
+                    quota_err_reply = await detect_and_format_quota_error(combined_err_text, model=session_data.get("model", ""))
+                if quota_err_reply:
+                    reply_text = quota_err_reply
+                    is_quota_exhausted = True
+                else:
+                    reply_text = stderr_text.strip() or "⚠️ 模型未返回任何有效回复，请重试或更换模型。"
+                is_error = True
+            elif is_quota_exhausted:
+                is_error = True
+            else:
+                approx_tokens = len(user_text) + len(reply_text)
+                if transcript_path and os.path.exists(transcript_path):
+                    try:
+                        current_size = os.path.getsize(transcript_path)
+                        added_bytes = max(0, current_size - initial_transcript_size)
+                        approx_tokens = int((len(user_text) + len(reply_text)) * 1.5 + added_bytes / 2.5)
+                    except Exception as e:
+                        log.error(f"Failed to calculate transcript token usage: {e}")
+                        
+                stats.record_tokens(approx_tokens)
+
+            choice_card_data = None
+            if not is_error:
+                reply_text, choice_card_data = extract_choice_card_data(
+                    reply_text,
+                    transcript_path=transcript_path,
+                    initial_transcript_size=initial_transcript_size
+                )
+                # Record whether this turn proposed a plan or asked a follow-up question for HMDM Markov state transition
+                tail_snippet = (reply_text or "")[-250:]
+                session_data["last_turn_proposed_plan"] = bool(
+                    choice_card_data
+                    or any(kw in tail_snippet for kw in ("是否", "请告知", "确认", "方案", "选择", "？", "?"))
+                )
+            else:
+                session_data["last_turn_proposed_plan"] = False
+
+            if reply_text:
+                log.info(f"[Agent text]: {reply_text[:100]}...")
+                
+            if os.path.exists(log_file_path):
+                await _sync_conversation_id_from_log(log_file_path)
+
+            is_voice_message = bool(
+                task_meta and (
+                    task_meta.get("message_type") == "audio" or 
+                    task_meta.get("is_voice_message")
+                )
+            )
+            # Sentry / Co-Pilot 必须在文字和语音发出前检查最终回复。
+            if reply_text and not typesafe_blocked_info:
+                if config.TYPESAFE_ENABLED and config.TYPESAFE_TIER in ("sentry", "copilot"):
+                    try:
+                        from system_one_gate import evaluate_output_guard
+                        guard_res = await evaluate_output_guard(reply_text)
+                        if not guard_res.is_fallback and guard_res.latency_ms > 0.1:
+                            session_data["typesafe_decision_count"] = session_data.get("typesafe_decision_count", 0) + 1
+                        if not guard_res.is_safe:
+                            log.warning(f"[TypeSafe Sentry] Output blocked before delivery: {guard_res.reason}")
+                            reply_text = (
+                                "🛡️ **[System One 内容安全拦截]**\n\n"
+                                f"系统检测到回复存在风险或检查服务不可用：{guard_res.reason}。"
+                            )
+                    except Exception as e:
+                        log.warning(f"[TypeSafe Sentry] Egress guard failed before delivery: {e}")
+                        reply_text = "🛡️ 回复安全检查未能完成，本次内容已暂缓发送。"
+
+            # 1. 优先生成并发送原生语音消息，确保语音条率先送达聊天窗口！
+            if is_voice_message and not is_error and reply_text:
+                try:
+                    from voice_service import send_native_voice_reply
+                    log.info("[Executor] Voice reply prioritized: generating and delivering audio message first...")
+                    await asyncio.wait_for(
+                        send_native_voice_reply(message_id, chat_id, reply_text, api_client),
+                        timeout=18.0
+                    )
+                except Exception as e:
+                    log.error(f"[Executor] Prioritized voice reply failed or timed out: {e}")
+
+            # 2. 语音消息已送达，紧接着让卡片启动打字机效果呈现完整文字
+            if not is_error and bot_reply_msg_id and reply_text:
+                try:
+                    safe_start_index = 0 if is_voice_message else min(last_streamed_length, len(reply_text))
+                    await _stream_typewriter_to_feishu(
+                        bot_reply_msg_id, reply_text, user_text, think_seconds, _feishu_call,
+                        start_index=safe_start_index,
+                        completed_steps_count=len(completed_tool_steps),
+                        total_planned_steps=len(planned_steps) if planned_steps else 0,
+                        is_voice=is_voice_message
+                    )
+                except Exception as e:
+                    log.error(f"[Executor] Typewriter streaming failed: {e}")
+
+            # 生成 System One 全链路审计摘要（存入 session_data 供卡片底部渲染展示）
+            try:
+                ts_tier = getattr(config, "TYPESAFE_TIER", "gateway") or "gateway"
+                ts_enabled = getattr(config, "TYPESAFE_ENABLED", True)
+                total_decisions = session_data.get("typesafe_decision_count", 0)
+                adaptive_tier = session_data.get("typesafe_adaptive_tier")
+                tier_suffix = f" · {adaptive_tier}" if adaptive_tier else ""
+
+                if ts_enabled:
+                    if typesafe_blocked_info:
+                        session_data["typesafe_audit_summary"] = "⚡️S1：L3全流程决策 · 高危操作待审批"
+                    elif ts_tier == "copilot":
+                        if total_decisions > 0:
+                            session_data["typesafe_audit_summary"] = f"⚡️S1：L3全流程决策x{total_decisions}次{tier_suffix}"
+                        else:
+                            session_data["typesafe_audit_summary"] = "⚡️S1：L3全流程决策x0"
+                    elif ts_tier == "sentry":
+                        if total_decisions > 0:
+                            session_data["typesafe_audit_summary"] = f"⚡️S1：L2双向决策x{total_decisions}次{tier_suffix}"
+                        else:
+                            session_data["typesafe_audit_summary"] = "⚡️S1：L2双向决策x0"
+                    elif ts_tier == "gateway":
+                        if total_decisions > 0:
+                            session_data["typesafe_audit_summary"] = f"⚡️S1：L1入口决策x{total_decisions}次{tier_suffix}"
+                        else:
+                            session_data["typesafe_audit_summary"] = "⚡️S1：L1入口决策x0"
+                else:
+                    session_data.pop("typesafe_audit_summary", None)
+            except Exception as e:
+                log.warning(f"[TypeSafe] Failed to build audit summary: {e}")
+
+            # 保存最近一轮 AI 回复和用户指令摘要到 session_data，供下一轮决策网关精准判断上下文任务
+            if reply_text and not is_error and not session_data.get("_isolated_pool_key"):
+                clean_reply = re.sub(r'```.*?```', '[代码块]', reply_text, flags=re.DOTALL)
+                clean_reply = re.sub(r'[\r\n]+', ' ', clean_reply).strip()
+                session_data["last_ai_summary"] = clean_reply[:500]
+                session_data["last_user_query"] = user_text[:200].strip()
+                try:
+                    await asyncio.wait_for(save_session_async(chat_id, session_data), timeout=2.0)
+                except Exception as e:
+                    log.warning(f"[Executor] Failed to persist last_ai_summary: {e}")
+
+            final_card = CardBuilder.build_ai_response(
+                reply_text, 
+                choice_card_data=choice_card_data,
+                current_model=session_data.get('model', 'Default'),
+                current_project=session_data.get('project', '默认'),
+                is_error=is_error,
+                is_streaming=False,
+                session_data=session_data,
+                is_quota=is_quota_exhausted
+            )
+            if bot_reply_msg_id:
+                patch_ok = await _feishu_call(
+                    lambda: patch_interactive_card_sdk(bot_reply_msg_id, final_card),
+                    label="final-card patch"
+                )
+                if patch_ok is None:
+                    from lark_client import send_reply_sdk
+                    fallback_text = reply_text[:2000] if reply_text else "(AI 回复卡片发送失败，请查看工作区获取完整内容)"
+                    await _feishu_call(
+                        lambda: send_reply_sdk(message_id, fallback_text),
+                        label="final-card text fallback"
+                    )
+            else:
+                if message_id and str(message_id).startswith("om_"):
+                    await _feishu_call(
+                        lambda: send_interactive_card_sdk(message_id, final_card),
+                        label="final-card send"
+                    )
+                else:
+                    from lark_client import send_card_to_chat_sdk
+                    await _feishu_call(
+                        lambda: send_card_to_chat_sdk(chat_id, final_card),
+                        label="final-card send to chat"
+                    )
+
+            return {"has_reply": bool(final_reply), "returncode": process.returncode, "is_error": is_error, "is_quota_error": is_quota_exhausted}
+
+        
+        finally:
+            if turn_stream is not None:
+                await turn_stream.aclose()
+            if sess_locked and 'sess' in dir() and sess.lock.locked():
+                sess.lock.release()
+            if session_data.get("_isolated_pool_key"):
+                running_processes.pop(pool_key, None)
+                try:
+                    from session_pool import session_pool
+                    await session_pool.reset_session(pool_key)
+                except Exception:
+                    pass
+            if os.path.exists(log_file_path):
+                try:
+                    await _sync_conversation_id_from_log(log_file_path)
+                finally:
+                    try:
+                        os.remove(log_file_path)
+                    except Exception:
+                        pass
+
+    MAX_ATTEMPTS = 2
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        res = await _run_single_attempt(attempt)
+        if res.get("is_quota_error") or res["has_reply"] or res["returncode"] == 0 or attempt == MAX_ATTEMPTS:
+            return res["is_error"]
+        log.warning(f"[Executor] Attempt {attempt}/{MAX_ATTEMPTS} failed/stalled without final response for chat {chat_id}. Automatically retrying attempt {attempt + 1}...")
+        await asyncio.sleep(1.0)
+    return True

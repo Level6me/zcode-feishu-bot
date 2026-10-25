@@ -1,0 +1,13 @@
+{
+  "id": "cron_scheduler",
+  "name": "⏱️ 计划任务与后台常驻调度中心",
+  "version": "3.0.0",
+  "author": "ZCode",
+  "description": "基于独立 PM2 守护引擎的高精度秒级倒计时、Cron 周期调度与 AI/运维巡检中心",
+  "commands": [
+    "/cron",
+    "/schedule"
+  ],
+  "daemon_script": "daemon.py",
+  "enabled": true
+}

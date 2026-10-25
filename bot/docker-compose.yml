@@ -1,0 +1,30 @@
+services:
+  feishu-bot:
+    build: .
+    container_name: zcode-feishu-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ZCODE_HOME: ${ZCODE_HOME:-/home/bot/.zcode}
+    volumes:
+      # Mount host zcode data (credentials, memory, session journals)
+      - ${HOST_ZCODE_HOME:-${HOME}/.zcode}:/home/bot/.zcode
+      # Workspace root served by the project browser card
+      - ${HOST_WORKSPACE:-${HOME}}:/home/bot/workspace
+      # Optional: mount the ZCode Desktop engine bundle (node + zcode.cjs)
+      # - /Applications/ZCode.app/Contents/Resources/glm:/opt/zcode-glm:ro
+    # The bot needs a reachable zcode engine; in Docker the simplest path is
+    # mounting the engine bundle and setting ZCODE_BIN inside .env.
+
+  # Optional keep-alive probe for the engine.
+  zcode-daemon:
+    build: .
+    container_name: zcode-feishu-daemon
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ZCODE_HOME: ${ZCODE_HOME:-/home/bot/.zcode}
+    volumes:
+      - ${HOST_ZCODE_HOME:-${HOME}/.zcode}:/home/bot/.zcode
+    command: ["python", "zcode_daemon.py"]
+    profiles: ["daemon"]

@@ -1,0 +1,32 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 凭证与私密配置（含飞书 Secret / API Key，绝不入库）
+.env
+*.key
+*.pem
+certs/
+
+# 运行时数据
+*.db
+*.db-shm
+*.db-wal
+backups/
+logs/
+run.log
+pm2.log
+nohup.out
+feishu_bot.log
+.bot.lock
+.bot.pid
+.update_pending.json
+chat_sessions.json
+user_profiles.json
+pending_*.json
+
+# 系统
+.DS_Store
+*.swp

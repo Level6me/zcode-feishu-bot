@@ -1,0 +1,15 @@
+{
+  "name": "github-local",
+  "plugins": [
+    {
+      "name": "zcode-feishu-bot",
+      "source": "./zcode-feishu-bot",
+      "version": "1.0.0",
+      "description": "Feishu bot bridge driven by the zcode engine - full feature port of antigravity-feishu-bot (cards, slash console, auth tiers, plugin ecosystem, cron, voice, multimodal).",
+      "displayName": "ZCode Feishu Bot",
+      "displayName_i18n": { "zh-CN": "ZCode 飞书机器人" },
+      "description_i18n": { "zh-CN": "飞书 × ZCode 引擎全能智能研发助手，antigravity-feishu-bot 的 100% 功能移植版（指令控制台 / 权限体系 / 插件生态 / 定时任务 / 语音多模态）。" },
+      "category": "productivity"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "zcode-feishu-bot",
+  "version": "1.0.0",
+  "description": "Feishu (Lark) bot bridge driven by the zcode engine: full-stack coding assistant, slash-command console, account plan manager, plugin ecosystem, cron scheduler, voice and multimodal delivery.",
+  "author": {
+    "name": "zcode-feishu-bot contributors"
+  },
+  "skills": "./skills"
+}
