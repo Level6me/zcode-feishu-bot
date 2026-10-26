@@ -14,6 +14,7 @@ Default:         127.0.0.1:8787 -> https://api.z.ai
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import sys
 import threading
@@ -60,7 +61,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.request(self.command, self.path, body=body, headers=out_headers)
             resp = conn.getresponse()
         except Exception as e:
-            payload = f'{"type":"error","error":{"type":"proxy_error","message":"upstream failed: {e}"}}'.encode()
+            payload = json.dumps({"type": "error", "error": {"type": "proxy_error", "message": f"upstream failed: {e}"}}).encode()
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
